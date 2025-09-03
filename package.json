@@ -1,0 +1,26 @@
+{
+  "name": "pdf-convert-screenshot-server",
+  "version": "1.0.0",
+  "description": "Node.js server that uses Puppeteer to capture screenshots from URLs",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "express": "^5.1.0",
+    "puppeteer": "^24.18.0"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "keywords": [
+    "puppeteer",
+    "screenshot",
+    "node",
+    "express",
+    "server"
+  ],
+  "author": "",
+  "license": "MIT"
+}
