@@ -1,251 +1,454 @@
 const express = require("express");
 const puppeteer = require("puppeteer");
+const crypto = require("crypto");
 
 const app = express();
 const PORT = process.env.PORT || 1234;
 
-// Middleware to parse JSON bodies (with larger limit for HTML content)
+// Performance optimizations
+const IS_PRODUCTION = process.env.NODE_ENV === "production";
+const MAX_CONCURRENT = parseInt(process.env.MAX_CONCURRENT) || 5;
+const CACHE_TTL = parseInt(process.env.CACHE_TTL) || 300000; // 5 minutes
+
+// Simple in-memory cache for repeated requests
+const imageCache = new Map();
+let activeRequests = 0;
+
+// Queue system for handling concurrent requests
+const requestQueue = [];
+let processing = false;
+
+// Browser instance management
+let browser = null;
+
+// Middleware optimizations
 app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ extended: true, limit: "50mb" }));
 
-// Health check endpoint
+// Add security headers
+app.use((req, res, next) => {
+  res.set({
+    "Cache-Control": "no-cache",
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "X-XSS-Protection": "1; mode=block",
+  });
+  next();
+});
+
+// Request throttling middleware
+app.use((req, res, next) => {
+  if (activeRequests >= MAX_CONCURRENT && req.path === "/html-to-image") {
+    return res.status(429).json({
+      error: "Server busy",
+      message: "Too many concurrent requests. Please retry in a few seconds.",
+      retryAfter: 3,
+    });
+  }
+  next();
+});
+
+// Image generation options
+const imageOptions = {
+  width: 1920,
+  height: 1080,
+  deviceScaleFactor: 1,
+  fullPage: true,
+  type: "png", // png, jpeg, webp
+  quality: 90, // for jpeg
+  timeout: 25000,
+};
+
+// Initialize browser instance
+async function initBrowser() {
+  if (!browser) {
+    browser = await puppeteer.launch({
+      headless: "new",
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--no-first-run",
+        "--no-zygote",
+        "--single-process",
+        "--disable-extensions",
+      ],
+    });
+  }
+  return browser;
+}
+
+// Utility functions
+function generateCacheKey(html, options) {
+  const content = html + JSON.stringify(options);
+  return crypto.createHash("md5").update(content).digest("hex");
+}
+
+function cleanupCache() {
+  const now = Date.now();
+  for (const [key, data] of imageCache.entries()) {
+    if (now - data.timestamp > CACHE_TTL) {
+      imageCache.delete(key);
+    }
+  }
+}
+
+// Cleanup cache every 5 minutes
+setInterval(cleanupCache, 300000);
+
+// Optimized image generation with caching
+async function generateImageOptimized(html, options = {}) {
+  const startTime = Date.now();
+  const cacheKey = generateCacheKey(html, options);
+
+  // Check cache first
+  if (imageCache.has(cacheKey)) {
+    const cached = imageCache.get(cacheKey);
+    if (Date.now() - cached.timestamp < CACHE_TTL) {
+      console.log(`Image served from cache (${Date.now() - startTime}ms)`);
+      return cached.buffer;
+    } else {
+      imageCache.delete(cacheKey);
+    }
+  }
+
+  const finalOptions = { ...imageOptions, ...options };
+
+  // Initialize browser if needed
+  const browserInstance = await initBrowser();
+  const page = await browserInstance.newPage();
+
+  try {
+    // Set viewport
+    await page.setViewport({
+      width: finalOptions.width,
+      height: finalOptions.height,
+      deviceScaleFactor: finalOptions.deviceScaleFactor,
+    });
+
+    // Set content and wait for load
+    await page.setContent(html, {
+      waitUntil: "networkidle0",
+      timeout: finalOptions.timeout,
+    });
+
+    // Generate screenshot
+    const screenshotOptions = {
+      fullPage: finalOptions.fullPage,
+      type: finalOptions.type,
+    };
+
+    if (finalOptions.type === "jpeg") {
+      screenshotOptions.quality = finalOptions.quality;
+    }
+
+    const imageBuffer = await page.screenshot(screenshotOptions);
+
+    // Cache the result
+    imageCache.set(cacheKey, {
+      buffer: imageBuffer,
+      timestamp: Date.now(),
+    });
+
+    const processingTime = Date.now() - startTime;
+    console.log(
+      `Image generated and cached (${processingTime}ms, ${imageBuffer.length} bytes)`
+    );
+
+    return imageBuffer;
+  } finally {
+    await page.close();
+  }
+}
+
 app.get("/", (req, res) => {
+  const memUsage = process.memoryUsage();
   res.json({
-    message: "HTML to PDF server is running",
+    message: "High-Performance HTML to Image Server",
+    version: "2.1.0",
+    engine: "puppeteer",
+    status: {
+      activeRequests: activeRequests,
+      maxConcurrent: MAX_CONCURRENT,
+      cacheSize: imageCache.size,
+      uptime: Math.round(process.uptime()),
+      memory: {
+        used: Math.round(memUsage.heapUsed / 1024 / 1024) + "MB",
+        total: Math.round(memUsage.heapTotal / 1024 / 1024) + "MB",
+      },
+    },
     endpoints: {
-      "html-to-pdf": "POST /html-to-pdf - Convert HTML content to PDF",
-      health: "GET / - Health check",
-      test: "GET /test-pdf - Generate test PDF",
+      "html-to-image": "POST /html-to-image - Convert HTML to Image (cached)",
+      test: "GET /test-image - Generate test image",
+      health: "GET / - Health check and status",
+      "cache-clear": "POST /cache-clear - Clear image cache",
     },
   });
 });
 
-// Helper function to generate PDF with retry logic
-async function generatePDF(html, options = {}, maxRetries = 2) {
-  let lastError;
+// Cache management endpoint
+app.post("/cache-clear", (req, res) => {
+  const cacheSize = imageCache.size;
+  imageCache.clear();
+  res.json({
+    message: "Cache cleared successfully",
+    clearedEntries: cacheSize,
+    timestamp: new Date().toISOString(),
+  });
+});
 
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    let browser = null;
-    let page = null;
+app.post("/html-to-image", async (req, res) => {
+  const requestStart = Date.now();
+  activeRequests++;
 
-    try {
-      console.log(`PDF generation attempt ${attempt}/${maxRetries}`);
-
-      // Launch browser with minimal settings for better stability
-      browser = await puppeteer.launch({
-        headless: true,
-        args: [
-          "--no-sandbox",
-          "--disable-setuid-sandbox",
-          "--disable-dev-shm-usage",
-        ],
-        timeout: 60000,
-      });
-
-      page = await browser.newPage();
-
-      console.log("Setting page content...");
-
-      // Set content with simpler wait condition
-      await page.setContent(html, {
-        waitUntil: "domcontentloaded",
-        timeout: 15000,
-      });
-
-      // Wait a bit for any dynamic content
-      //   await page.waitForTimeout(1000);
-      await delay(2000); // wait 2 seconds between retries
-
-      console.log("Generating PDF...");
-
-      // Default PDF options
-      const pdfOptions = {
-        format: "A4",
-        printBackground: true,
-        margin: {
-          top: "1cm",
-          right: "1cm",
-          bottom: "1cm",
-          left: "1cm",
-        },
-        timeout: 30000,
-        ...options,
-      };
-
-      // Generate PDF with timeout
-      const pdf = await page.pdf(pdfOptions);
-
-      console.log(`PDF generated successfully (${pdf.length} bytes)`);
-
-      return pdf;
-    } catch (error) {
-      lastError = error;
-      console.error(`PDF generation attempt ${attempt} failed:`, error.message);
-
-      if (attempt === maxRetries) {
-        throw lastError;
-      }
-
-      // Wait before retry
-      console.log(`Waiting before retry attempt ${attempt + 1}...`);
-      await new Promise((resolve) => setTimeout(resolve, 2000));
-    } finally {
-      // Always close page and browser
-      if (page) {
-        try {
-          if (!page.isClosed()) {
-            await page.close();
-          }
-        } catch (closeError) {
-          console.warn("Error closing page:", closeError.message);
-        }
-      }
-
-      if (browser) {
-        try {
-          await browser.close();
-        } catch (browserCloseError) {
-          console.warn("Error closing browser:", browserCloseError.message);
-        }
-      }
-    }
-  }
-}
-
-function delay(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-// HTML to PDF endpoint
-app.post("/html-to-pdf", async (req, res) => {
   try {
     const { html, options = {} } = req.body;
 
+    // Enhanced validation
     if (!html) {
       return res.status(400).json({
         error: "HTML content is required",
-        usage:
-          'POST /html-to-pdf with { "html": "<html>...</html>", "options": {...} }',
-        availableOptions: {
-          format: "A4, A3, A2, A1, A0, Letter, Legal, Tabloid, Ledger",
-          width: "CSS width (e.g., '210mm', '8.5in')",
-          height: "CSS height (e.g., '297mm', '11in')",
-          margin: "Object with top, right, bottom, left margins",
-          displayHeaderFooter: "Boolean to show header/footer",
-          headerTemplate: "HTML template for header",
-          footerTemplate: "HTML template for footer",
-          printBackground: "Boolean to include background graphics",
-          landscape: "Boolean for landscape orientation",
-          pageRanges: "String of page ranges (e.g., '1-3, 5')",
-          scale: "Number between 0.1 and 2",
-        },
+        usage: "Send JSON with 'html' field containing HTML content",
       });
     }
 
-    console.log(`Converting HTML to PDF (${html.length} characters)`);
+    if (html.length > 10 * 1024 * 1024) {
+      // 10MB limit
+      return res.status(413).json({
+        error: "HTML content too large",
+        maxSize: "10MB",
+        received: `${Math.round((html.length / 1024 / 1024) * 100) / 100}MB`,
+      });
+    }
 
-    const pdf = await generatePDF(html, options);
+    console.log(
+      `[${new Date().toISOString()}] Processing image request (${
+        html.length
+      } chars, ${activeRequests} active)`
+    );
 
-    // Set response headers for PDF download
-    res.setHeader("Content-Type", "application/pdf");
-    res.setHeader("Content-Disposition", 'attachment; filename="document.pdf"');
-    res.setHeader("Content-Length", pdf.length);
+    // Use optimized image generation with caching
+    const imageBuffer = await generateImageOptimized(html, options);
+    const totalTime = Date.now() - requestStart;
 
-    // Send PDF as response
-    res.send(pdf);
+    // Determine content type based on image format
+    const format = options.type || imageOptions.type;
+    const contentType =
+      format === "jpeg"
+        ? "image/jpeg"
+        : format === "webp"
+        ? "image/webp"
+        : "image/png";
+
+    // Set optimized headers
+    res.setHeader("Content-Type", contentType);
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="screenshot.${format}"`
+    );
+    res.setHeader("Content-Length", imageBuffer.length);
+    res.setHeader("X-Processing-Time", `${totalTime}ms`);
+    res.setHeader(
+      "X-Cache-Status",
+      imageCache.has(generateCacheKey(html, options)) ? "HIT" : "MISS"
+    );
+
+    res.send(imageBuffer);
+
+    console.log(
+      `[${new Date().toISOString()}] Image delivered (${totalTime}ms, ${
+        imageBuffer.length
+      } bytes)`
+    );
   } catch (error) {
-    console.error("Server error:", error);
+    const totalTime = Date.now() - requestStart;
+    console.error(
+      `[${new Date().toISOString()}] Image generation failed (${totalTime}ms):`,
+      error.message
+    );
+
     res.status(500).json({
-      error: "Failed to generate PDF",
+      error: "Failed to generate image",
       details: error.message,
+      processingTime: `${totalTime}ms`,
+      timestamp: new Date().toISOString(),
     });
+  } finally {
+    activeRequests = Math.max(0, activeRequests - 1);
   }
 });
 
-// GET endpoint for testing with simple HTML
-app.get("/test-pdf", async (req, res) => {
-  const sampleHtml = `
+app.get("/test-image", async (req, res) => {
+  const startTime = Date.now();
+  activeRequests++;
+
+  const testHtml = `
     <!DOCTYPE html>
     <html>
     <head>
-        <meta charset="UTF-8">
-        <title>Test PDF</title>
-        <style>
-            body { font-family: Arial, sans-serif; margin: 40px; }
-            h1 { color: #333; }
-            p { line-height: 1.6; }
-            .highlight { background-color: yellow; }
-        </style>
+      <meta charset="UTF-8">
+      <style>
+        body { 
+          font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; 
+          margin: 20px; 
+          line-height: 1.6;
+          background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+          color: white;
+          min-height: 100vh;
+          display: flex;
+          flex-direction: column;
+          justify-content: center;
+        }
+        .container {
+          max-width: 800px;
+          margin: 0 auto;
+          text-align: center;
+        }
+        h1 { 
+          color: #ffffff; 
+          margin-bottom: 20px; 
+          font-size: 3em;
+          text-shadow: 2px 2px 4px rgba(0,0,0,0.3);
+        }
+        .info { 
+          background: rgba(255,255,255,0.1); 
+          padding: 30px; 
+          border-radius: 15px; 
+          margin: 20px 0; 
+          backdrop-filter: blur(10px);
+          border: 1px solid rgba(255,255,255,0.2);
+        }
+        .performance { 
+          color: #00ff88; 
+          font-weight: bold; 
+          font-size: 1.2em;
+        }
+        .timestamp {
+          font-size: 0.9em;
+          opacity: 0.8;
+        }
+      </style>
     </head>
     <body>
-        <h1>Test PDF Document</h1>
-        <p>This is a <span class="highlight">test PDF</span> generated from HTML content.</p>
-        <p>Current time: ${new Date().toISOString()}</p>
-        <ul>
-            <li>First item</li>
-            <li>Second item</li>
-            <li>Third item</li>
-        </ul>
+      <div class="container">
+        <h1>📸 High-Performance Image Generator</h1>
+        <div class="info">
+          <p><strong>Generated at:</strong> <span class="timestamp">${new Date().toISOString()}</span></p>
+          <p><strong>Engine:</strong> Puppeteer (optimized)</p>
+          <p><strong>Features:</strong> Caching, Queue Management, Multiple Formats</p>
+          <p class="performance">⚡ Optimized for speed and quality!</p>
+        </div>
+        <p>This image demonstrates the enhanced performance capabilities of the server.</p>
+        <p>Subsequent requests for identical content will be served from cache for instant delivery.</p>
+        <p>🚀 Supports PNG, JPEG, and WebP formats</p>
+      </div>
     </body>
     </html>
   `;
 
   try {
-    console.log("Generating test PDF");
+    console.log(`[${new Date().toISOString()}] Generating test image...`);
 
-    const pdf = await generatePDF(sampleHtml);
+    const imageBuffer = await generateImageOptimized(testHtml, {});
+    const processingTime = Date.now() - startTime;
 
-    // Set response headers for PDF download
-    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Type", "image/png");
     res.setHeader(
       "Content-Disposition",
-      'attachment; filename="test-document.pdf"'
+      'attachment; filename="performance-test.png"'
     );
-    res.setHeader("Content-Length", pdf.length);
+    res.setHeader("Content-Length", imageBuffer.length);
+    res.setHeader("X-Processing-Time", `${processingTime}ms`);
 
-    // Send PDF as response
-    res.send(pdf);
+    res.send(imageBuffer);
+
+    console.log(
+      `[${new Date().toISOString()}] Test image delivered (${processingTime}ms)`
+    );
   } catch (error) {
-    console.error("Test PDF error:", error);
+    const processingTime = Date.now() - startTime;
+    console.error(`Test image failed (${processingTime}ms):`, error.message);
     res.status(500).json({
-      error: "Failed to generate test PDF",
+      error: "Test failed",
       details: error.message,
+      processingTime: `${processingTime}ms`,
     });
+  } finally {
+    activeRequests = Math.max(0, activeRequests - 1);
   }
 });
 
-// Error handling middleware
-app.use((error, req, res, next) => {
-  console.error("Unhandled error:", error);
-  res.status(500).json({
-    error: "Internal server error",
-    details: error.message,
-  });
+// Enhanced server startup with performance monitoring
+const server = app.listen(PORT, async () => {
+  console.log(`🚀 High-Performance Image Server started`);
+  console.log(`📡 Port: ${PORT}`);
+  console.log(`⚡ Max concurrent requests: ${MAX_CONCURRENT}`);
+  console.log(`💾 Cache TTL: ${CACHE_TTL / 1000}s`);
+  console.log(`🏃 Node.js: ${process.version}`);
+  console.log(`💻 Platform: ${process.platform} ${process.arch}`);
+  console.log(
+    `🌐 Environment: ${IS_PRODUCTION ? "Production" : "Development"}`
+  );
+  console.log(`📸 Default format: ${imageOptions.type.toUpperCase()}`);
+  console.log(`📏 Default size: ${imageOptions.width}x${imageOptions.height}`);
+  console.log(`\n📊 Endpoints:`);
+  console.log(`   GET  / - Health check and metrics`);
+  console.log(`   POST /html-to-image - Convert HTML to Image (cached)`);
+  console.log(`   GET  /test-image - Performance test`);
+  console.log(`   POST /cache-clear - Clear cache\n`);
+
+  // Initialize browser on startup
+  try {
+    await initBrowser();
+    console.log(`🌐 Browser initialized successfully`);
+  } catch (error) {
+    console.error(`❌ Failed to initialize browser:`, error.message);
+  }
 });
 
-// 404 handler
-app.use((req, res) => {
-  res.status(404).json({
-    error: "Endpoint not found",
-    available: ["GET /", "POST /html-to-pdf", "GET /test-pdf"],
-  });
-});
-
-// Start server
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`HTML to PDF server running on port ${PORT}`);
-  console.log(`Health check: http://localhost:${PORT}/`);
-  console.log(`PDF API: POST http://localhost:${PORT}/html-to-pdf`);
-  console.log(`Test PDF: GET http://localhost:${PORT}/test-pdf`);
-});
+// Optimize server settings
+server.timeout = 30000; // 30 seconds
+server.keepAliveTimeout = 5000; // 5 seconds
+server.headersTimeout = 6000; // 6 seconds
 
 // Graceful shutdown
-process.on("SIGTERM", () => {
-  console.log("SIGTERM received, shutting down gracefully");
-  process.exit(0);
+process.on("SIGTERM", async () => {
+  console.log("📋 SIGTERM received, shutting down gracefully...");
+  server.close(async () => {
+    console.log("✅ HTTP server closed");
+    imageCache.clear();
+    console.log("🗑️  Cache cleared");
+    if (browser) {
+      await browser.close();
+      console.log("🌐 Browser closed");
+    }
+    process.exit(0);
+  });
 });
 
-process.on("SIGINT", () => {
-  console.log("SIGINT received, shutting down gracefully");
-  process.exit(0);
+process.on("SIGINT", async () => {
+  console.log("\n📋 SIGINT received, shutting down gracefully...");
+  server.close(async () => {
+    console.log("✅ HTTP server closed");
+    imageCache.clear();
+    console.log("🗑️  Cache cleared");
+    if (browser) {
+      await browser.close();
+      console.log("🌐 Browser closed");
+    }
+    process.exit(0);
+  });
 });
+
+// Performance monitoring
+if (IS_PRODUCTION) {
+  setInterval(() => {
+    const memUsage = process.memoryUsage();
+    console.log(
+      `📊 Stats - Active: ${activeRequests}, Cache: ${
+        imageCache.size
+      }, Memory: ${Math.round(memUsage.heapUsed / 1024 / 1024)}MB`
+    );
+  }, 60000); // Log every minute
+}
