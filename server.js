@@ -34,6 +34,8 @@ async function generatePDF(html, options = {}, maxRetries = 2) {
       // Launch browser with minimal settings for better stability
       browser = await puppeteer.launch({
         headless: true,
+        executablePath:
+          process.env.PUPPETEER_EXECUTABLE_PATH || "/usr/bin/google-chrome",
         args: [
           "--no-sandbox",
           "--disable-setuid-sandbox",
