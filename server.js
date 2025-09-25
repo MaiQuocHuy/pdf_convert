@@ -62,7 +62,7 @@ const imageOptions = {
 // Initialize browser instance
 async function initBrowser() {
   if (!browser) {
-    browser = await puppeteer.launch({
+    const launchOptions = {
       headless: "new",
       args: [
         "--no-sandbox",
@@ -73,8 +73,44 @@ async function initBrowser() {
         "--no-zygote",
         "--single-process",
         "--disable-extensions",
+        "--disable-default-apps",
+        "--disable-web-security",
+        "--disable-features=VizDisplayCompositor",
+        "--disable-background-timer-throttling",
+        "--disable-renderer-backgrounding",
+        "--disable-backgrounding-occluded-windows",
+        "--disable-ipc-flooding-protection",
+        "--enable-features=NetworkService,NetworkServiceInProcess",
+        "--force-color-profile=srgb",
+        "--metrics-recording-only",
+        "--use-mock-keychain",
       ],
-    });
+    };
+
+    // Sử dụng executablePath nếu trong Docker container
+    if (process.env.PUPPETEER_EXECUTABLE_PATH) {
+      launchOptions.executablePath = process.env.PUPPETEER_EXECUTABLE_PATH;
+    }
+
+    try {
+      browser = await puppeteer.launch(launchOptions);
+      console.log("🌐 Browser initialized successfully");
+    } catch (error) {
+      console.error("❌ Failed to initialize browser:", error.message);
+
+      // Retry với cấu hình đơn giản hơn
+      console.log("🔄 Retrying with minimal configuration...");
+      launchOptions.args = [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--single-process",
+      ];
+
+      browser = await puppeteer.launch(launchOptions);
+      console.log("🌐 Browser initialized with minimal config");
+    }
   }
   return browser;
 }
@@ -401,9 +437,9 @@ const server = app.listen(PORT, async () => {
   // Initialize browser on startup
   try {
     await initBrowser();
-    console.log(`🌐 Browser initialized successfully`);
   } catch (error) {
-    console.error(`❌ Failed to initialize browser:`, error.message);
+    console.error(`❌ Failed to initialize browser on startup:`, error.message);
+    console.log(`⚠️  Browser will be initialized on first request`);
   }
 });
 
